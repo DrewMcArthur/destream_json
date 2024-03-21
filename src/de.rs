@@ -12,7 +12,7 @@ use futures::stream::{Fuse, FusedStream, Stream, StreamExt, TryStreamExt};
 #[cfg(feature = "tokio-io")]
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
-use crate::constants::*;
+use crate::{constants::*, error::ErrorCode};
 
 const SNIPPET_LEN: usize = 50;
 
@@ -101,6 +101,10 @@ impl Error {
 
     fn unexpected_end() -> Self {
         de::Error::custom("unexpected end of stream")
+    }
+
+    fn error_code(code: ErrorCode) -> Self {
+        de::Error::custom(code)
     }
 }
 
@@ -335,15 +339,21 @@ impl<S: Read> Decoder<S> {
         Ok(())
     }
 
+    // loads data until buffer is at least `n` bytes
+    async fn buffer_chars(&mut self, n: usize) -> Result<(), Error> {
+        while n >= self.buffer.len() && !self.source.is_terminated() {
+            self.buffer().await?;
+        }
+        Ok(())
+    }
+
     async fn buffer_string(&mut self) -> Result<Vec<u8>, Error> {
         self.expect_delimiter(QUOTE).await?;
 
         let mut i = 0;
         let mut escaped = false;
         loop {
-            while i >= self.buffer.len() && !self.source.is_terminated() {
-                self.buffer().await?;
-            }
+            self.buffer_chars(i).await?;
 
             if i < self.buffer.len() && &self.buffer[i..i + 1] == QUOTE && !escaped {
                 break;
@@ -418,6 +428,12 @@ impl<S: Read> Decoder<S> {
         }
     }
 
+    async fn eat_char(&mut self) -> Result<(), Error> {
+        self.buffer_chars(1).await?;
+        self.buffer.rotate_right(1);
+        Ok(())
+    }
+
     async fn expect_delimiter(&mut self, delimiter: &'static [u8]) -> Result<(), Error> {
         while self.buffer.is_empty() && !self.source.is_terminated() {
             self.buffer().await?;
@@ -446,27 +462,185 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn ignore_value(&mut self) -> Result<(), Error> {
-        self.expect_whitespace().await?;
+        let scratch = Vec::<u8>::new();
+        let mut enclosing = None;
 
-        while self.buffer.is_empty() && !self.source.is_terminated() {
-            self.buffer().await?;
-        }
+        loop {
+            let peek = match self.parse_whitespace().await? {
+                Some(b) => b,
+                None => {
+                    return Err(Error::error_code(ErrorCode::EofWhileParsingValue));
+                }
+            };
 
-        if self.buffer.is_empty() {
-            Ok(())
-        } else {
-            if self.buffer.starts_with(QUOTE) {
-                self.parse_string().await?;
-            } else if self.numeric.contains(&self.buffer[0]) {
-                self.parse_number::<f64>().await?;
-            } else if self.buffer[0] == b'n' {
-                self.parse_unit().await?;
-            } else {
-                self.parse_bool().await?;
+            let frame = match peek {
+                b'n' => {
+                    self.eat_char();
+                    self.parse_ident(b"ull").await?;
+                    None
+                }
+                b't' => {
+                    self.eat_char();
+                    self.parse_ident(b"rue").await?;
+                    None
+                }
+                b'f' => {
+                    self.eat_char();
+                    self.parse_ident(b"alse").await?;
+                    None
+                }
+                b'-' => {
+                    self.eat_char();
+                    self.ignore_integer().await?;
+                    None
+                }
+                b'0'..=b'9' => {
+                    self.ignore_integer().await?;
+                    None
+                }
+                b'"' => {
+                    self.eat_char();
+                    self.ignore_str()?;
+                    None
+                }
+                frame @ (b'[' | b'{') => {
+                    scratch.extend(enclosing.take());
+                    self.eat_char();
+                    Some(frame)
+                }
+                _ => return Err(Error::error_code(ErrorCode::ExpectedSomeValue)),
+            };
+
+            let (mut accept_comma, mut frame) = match frame {
+                Some(frame) => (false, frame),
+                None => match enclosing.take() {
+                    Some(frame) => (true, frame),
+                    None => match scratch.pop() {
+                        Some(frame) => (true, frame),
+                        None => return Ok(()),
+                    },
+                },
+            };
+
+            loop {
+                match self.parse_whitespace().await? {
+                    Some(b',') if accept_comma => {
+                        self.eat_char();
+                        break;
+                    }
+                    Some(b']') if frame == b'[' => {}
+                    Some(b'}') if frame == b'{' => {}
+                    Some(_) => {
+                        if accept_comma {
+                            return Err(Error::error_code(match frame {
+                                b'[' => ErrorCode::ExpectedListCommaOrEnd,
+                                b'{' => ErrorCode::ExpectedObjectCommaOrEnd,
+                                _ => unreachable!(),
+                            }));
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {
+                        return Err(Error::error_code(match frame {
+                            b'[' => ErrorCode::EofWhileParsingList,
+                            b'{' => ErrorCode::EofWhileParsingObject,
+                            _ => unreachable!(),
+                        }));
+                    }
+                }
+
+                self.eat_char();
+                frame = match scratch.pop() {
+                    Some(frame) => frame,
+                    None => return Ok(()),
+                };
+                accept_comma = true;
             }
 
-            Ok(())
+            if frame == b'{' {
+                match self.parse_whitespace().await? {
+                    Some(b'"') => self.eat_char().await?,
+                    Some(_) => return Err(Error::error_code(ErrorCode::KeyMustBeAString)),
+                    None => return Err(Error::error_code(ErrorCode::EofWhileParsingObject)),
+                }
+                self.ignore_str()?;
+                match self.parse_whitespace().await? {
+                    Some(b':') => self.eat_char().await?,
+                    Some(_) => return Err(Error::error_code(ErrorCode::ExpectedColon)),
+                    None => return Err(Error::error_code(ErrorCode::EofWhileParsingObject)),
+                }
+            }
+
+            enclosing = Some(frame);
         }
+    }
+
+    async fn ignore_integer(&mut self) -> Result<(), Error> {
+        match self.next_char_or_null().await? {
+            b'0' => {
+                // There can be only one leading '0'.
+                if let b'0'..=b'9' = self.peek_or_null().await? {
+                    return Err(Error::error_code(ErrorCode::InvalidNumber));
+                }
+            }
+            b'1'..=b'9' => {
+                while let b'0'..=b'9' = self.peek_or_null().await? {
+                    self.eat_char();
+                }
+            }
+            _ => {
+                return Err(Error::error_code(ErrorCode::InvalidNumber));
+            }
+        }
+
+        match self.peek_or_null().await? {
+            b'.' => self.ignore_decimal().await,
+            b'e' | b'E' => self.ignore_exponent().await,
+            _ => Ok(()),
+        }
+    }
+
+    async fn ignore_decimal(&mut self) -> Result<(), Error> {
+        self.eat_char();
+
+        let mut at_least_one_digit = false;
+        while let b'0'..=b'9' = self.peek_or_null().await? {
+            self.eat_char();
+            at_least_one_digit = true;
+        }
+
+        if !at_least_one_digit {
+            return Err(Error::error_code(ErrorCode::InvalidNumber));
+        }
+
+        match self.peek_or_null().await? {
+            b'e' | b'E' => self.ignore_exponent().await,
+            _ => Ok(()),
+        }
+    }
+
+    async fn ignore_exponent(&mut self) -> Result<(), Error> {
+        self.eat_char();
+
+        match self.peek_or_null().await? {
+            b'+' | b'-' => self.eat_char().await?,
+            _ => {}
+        }
+
+        // Make sure a digit follows the exponent place.
+        match self.next_char_or_null().await? {
+            b'0'..=b'9' => {}
+            _ => {
+                return Err(Error::error_code(ErrorCode::InvalidNumber));
+            }
+        }
+
+        while let b'0'..=b'9' = self.peek_or_null().await? {
+            self.eat_char();
+        }
+
+        Ok(())
     }
 
     async fn maybe_delimiter(&mut self, delimiter: &'static [u8]) -> Result<bool, Error> {
@@ -482,6 +656,16 @@ impl<S: Read> Decoder<S> {
         } else {
             Ok(false)
         }
+    }
+
+    async fn next_char(&mut self) -> Result<Option<u8>, Error> {
+        let ch = self.buffer.first().map(|c| c.to_owned());
+        self.buffer.rotate_right(1);
+        Ok(ch)
+    }
+
+    async fn next_char_or_null(&mut self) -> Result<u8, Error> {
+        Ok(self.next_char().await?.unwrap_or(b'\x00'))
     }
 
     async fn parse_bool(&mut self) -> Result<bool, Error> {
@@ -512,6 +696,26 @@ impl<S: Read> Decoder<S> {
         let i = Ord::min(self.buffer.len(), SNIPPET_LEN);
         let unknown = String::from_utf8(self.buffer[..i].to_vec()).map_err(Error::invalid_utf8)?;
         Err(de::Error::invalid_value(unknown, &"a boolean"))
+    }
+
+    async fn parse_ident(&mut self, ident: &[u8]) -> Result<(), Error> {
+        for expected in ident {
+            match self.next_char().await? {
+                None => {
+                    return Err(de::Error::custom("ran out of characters parsing ident"));
+                }
+                Some(next) => {
+                    if next != *expected {
+                        return Err(de::Error::invalid_value(
+                            next,
+                            format!("expected {} while parsing ident {:?}", expected, ident),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn parse_number<N: FromStr>(&mut self) -> Result<N, Error>
@@ -555,6 +759,34 @@ impl<S: Read> Decoder<S> {
 
             Err(de::Error::invalid_type(as_str, &"null"))
         }
+    }
+
+    /// Returns the first non-whitespace byte without consuming it, or `None` if
+    /// EOF is encountered.
+    /// TODO: this is the same as `expect_whitespace`; this matches the serde impl
+    async fn parse_whitespace(&mut self) -> Result<Option<u8>, Error> {
+        loop {
+            match self.peek().await? {
+                Some(b' ' | b'\n' | b'\t' | b'\r') => {
+                    self.eat_char().await?;
+                }
+                other => {
+                    return Ok(other);
+                }
+            }
+        }
+    }
+
+    async fn peek(&mut self) -> Result<Option<u8>, Error> {
+        if self.buffer.is_empty() && !self.source.is_terminated() {
+            self.buffer().await?;
+        }
+        let first = self.buffer.first().map(|c| c.to_owned());
+        Ok(first)
+    }
+
+    async fn peek_or_null(&mut self) -> Result<u8, Error> {
+        Ok(self.peek().await?.unwrap_or(b'\x00'))
     }
 }
 

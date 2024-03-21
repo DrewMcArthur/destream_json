@@ -28,6 +28,7 @@ pub use de::read_from;
 mod constants;
 pub mod de;
 pub mod en;
+mod error;
 
 #[cfg(feature = "value")]
 mod value;
