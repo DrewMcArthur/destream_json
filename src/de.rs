@@ -1,11 +1,10 @@
 //! Decode a JSON stream to a Rust data structure.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
+use std::{collections::HashSet, future::Future};
 
 use async_recursion::async_recursion;
-use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
 use destream::{de, FromStream, Visitor};
 use futures::stream::{Fuse, FusedStream, Stream, StreamExt, TryStreamExt};
@@ -18,10 +17,9 @@ use crate::constants::*;
 const SNIPPET_LEN: usize = 50;
 
 /// Methods common to any decodable [`Stream`]
-#[async_trait]
 pub trait Read: Send + Unpin {
     /// Read the next chunk of [`Bytes`] in this [`Stream`].
-    async fn next(&mut self) -> Option<Result<Bytes, Error>>;
+    fn next(&mut self) -> impl Future<Output = Option<Result<Bytes, Error>>> + Send;
 
     /// Return `true` if there are no more contents to be read from this [`Stream`].
     fn is_terminated(&self) -> bool;
@@ -32,7 +30,6 @@ pub struct SourceStream<S> {
     source: Fuse<S>,
 }
 
-#[async_trait]
 impl<S: Stream<Item = Result<Bytes, Error>> + Send + Unpin> Read for SourceStream<S> {
     async fn next(&mut self) -> Option<Result<Bytes, Error>> {
         self.source.next().await
@@ -58,7 +55,6 @@ pub struct SourceReader<R: AsyncRead> {
 }
 
 #[cfg(feature = "tokio-io")]
-#[async_trait]
 impl<R: AsyncRead + Send + Unpin> Read for SourceReader<R> {
     async fn next(&mut self) -> Option<Result<Bytes, Error>> {
         let mut chunk = Vec::new();
@@ -154,7 +150,6 @@ impl<'a, S: Read + 'a> MapAccess<'a, S> {
     }
 }
 
-#[async_trait]
 impl<'a, S: Read + 'a> de::MapAccess for MapAccess<'a, S> {
     type Error = Error;
 
@@ -223,7 +218,6 @@ impl<'a, S: Read + 'a> SeqAccess<'a, S> {
     }
 }
 
-#[async_trait]
 impl<'a, S: Read + 'a> de::SeqAccess for SeqAccess<'a, S> {
     type Error = Error;
 
@@ -253,7 +247,6 @@ impl<'a, S: Read + 'a> de::SeqAccess for SeqAccess<'a, S> {
     }
 }
 
-#[async_trait]
 impl<'a, S: Read + 'a, T: FromStream<Context = ()> + 'a> de::ArrayAccess<T> for SeqAccess<'a, S> {
     type Error = Error;
 
@@ -829,7 +822,6 @@ impl<S: Read> Decoder<S> {
     }
 }
 
-#[async_trait]
 impl<S: Read> de::Decoder for Decoder<S> {
     type Error = Error;
 
