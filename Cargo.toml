@@ -22,7 +22,7 @@ async-recursion = "1.1"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1.7"
-destream = "0.8"
+destream = { git = "https://github.com/drewmcarthur/destream.git", branch = "add-derivability" }
 futures = "0.3"
 number-general = { version = "0.12", optional = true }
 pin-project = "1.1"
