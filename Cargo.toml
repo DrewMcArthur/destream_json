@@ -24,7 +24,7 @@ base64 = "0.22"
 bytes = "1.7"
 destream = { git = "https://github.com/drewmcarthur/destream.git", branch = "add-derivability" }
 futures = "0.3"
-number-general = { version = "0.12", optional = true }
+number-general = { git="https://github.com/drewmcarthur/number-general.git", branch = "add-derivability", optional = true }
 pin-project = "1.1"
 tokio = { version = "1.35", features = ["io-util"], optional = true }
 uuid = "1.10"
