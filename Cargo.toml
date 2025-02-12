@@ -30,7 +30,7 @@ tokio = { version = "1.35", features = ["io-util"], optional = true }
 uuid = "1.10"
 
 [dev-dependencies]
-number-general = { version = "0.12", features=["stream"] }
+number-general = { git="https://github.com/drewmcarthur/number-general.git", branch = "add-derivability", features=["stream"] }
 tokio = { version = "1.39", features = ["fs", "macros"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-test = "0.4"
